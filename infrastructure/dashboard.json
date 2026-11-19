@@ -1,0 +1,53 @@
+{
+  "start": "-PT30M",
+  "widgets": [
+    {
+      "type": "metric", "x": 0, "y": 0, "width": 12, "height": 7,
+      "properties": {
+        "title": "SQS backlog vs. worker tasks (scale-out on queue depth)",
+        "region": "us-west-2", "view": "timeSeries", "stacked": false, "period": 60,
+        "metrics": [
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "shop-orders", {"stat": "Sum", "label": "Messages visible"}],
+          ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "shop-cluster", "ServiceName", "shop-worker", {"stat": "Average", "yAxis": "right", "label": "Running worker tasks"}]
+        ],
+        "yAxis": {"left": {"label": "messages", "min": 0}, "right": {"label": "tasks", "min": 0}}
+      }
+    },
+    {
+      "type": "metric", "x": 12, "y": 0, "width": 12, "height": 7,
+      "properties": {
+        "title": "Backlog per task (target tracking metric, target = 20)",
+        "region": "us-west-2", "view": "timeSeries", "period": 60,
+        "metrics": [
+          [{"expression": "visible / IF(tasks > 0, tasks, 1)", "label": "Backlog per task", "id": "e1"}],
+          ["AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "shop-orders", {"stat": "Sum", "id": "visible", "visible": false}],
+          ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "shop-cluster", "ServiceName", "shop-worker", {"stat": "Average", "id": "tasks", "visible": false}]
+        ],
+        "annotations": {"horizontal": [{"label": "target", "value": 20}]},
+        "yAxis": {"left": {"min": 0}}
+      }
+    },
+    {
+      "type": "metric", "x": 0, "y": 7, "width": 12, "height": 6,
+      "properties": {
+        "title": "Messages processed (deleted) per minute",
+        "region": "us-west-2", "view": "timeSeries", "period": 60,
+        "metrics": [
+          ["AWS/SQS", "NumberOfMessagesDeleted", "QueueName", "shop-orders", {"stat": "Sum", "label": "Orders processed / min"}]
+        ]
+      }
+    },
+    {
+      "type": "metric", "x": 12, "y": 7, "width": 12, "height": 6,
+      "properties": {
+        "title": "Web tier: ALB requests and healthy targets",
+        "region": "us-west-2", "view": "timeSeries", "period": 60,
+        "metrics": [
+          ["ECS/ContainerInsights", "RunningTaskCount", "ClusterName", "shop-cluster", "ServiceName", "shop-web", {"stat": "Average", "label": "Running web tasks"}],
+          ["AWS/Route53", "HealthCheckStatus", "HealthCheckId", "HEALTH_CHECK_ID", {"stat": "Minimum", "region": "us-east-1", "label": "Route 53 health check (1 = healthy)", "yAxis": "right"}]
+        ],
+        "yAxis": {"left": {"min": 0}, "right": {"min": 0, "max": 1}}
+      }
+    }
+  ]
+}
