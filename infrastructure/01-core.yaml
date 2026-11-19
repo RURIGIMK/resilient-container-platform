@@ -1,0 +1,357 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient container platform - core layer. Multi-AZ VPC, ALB, ECS cluster, ECR repositories,
+  RDS PostgreSQL Multi-AZ, ElastiCache Redis (Multi-AZ, automatic failover), SQS order queue + DLQ,
+  and an AWS Backup plan for daily RDS snapshots.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shop
+  VpcCidr:
+    Type: String
+    Default: 10.20.0.0/16
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+  CacheNodeType:
+    Type: String
+    Default: cache.t3.micro
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+
+Resources:
+  # ---------------------------------------------------------------- Network
+  # Two public subnets (ALB + Fargate tasks with public IPs - no NAT gateway to become a
+  # single point of failure or a cost sink) and two private subnets (RDS + ElastiCache).
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-vpc' }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-a' }]
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, 8]]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-public-b' }]
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-a' }]
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, 8]]
+      Tags: [{ Key: Name, Value: !Sub '${ProjectName}-private-b' }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+  PublicSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+  PublicSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+  PrivateSubnetARouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTable
+  PrivateSubnetBRouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTable
+
+  # ---------------------------------------------------------------- Security groups
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP to the ALB
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 80, ToPort: 80, CidrIp: 0.0.0.0/0 }
+  AppSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Fargate tasks - only the ALB may reach the web port
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 8080, ToPort: 8080, SourceSecurityGroupId: !Ref AlbSecurityGroup }
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: PostgreSQL from app tasks only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 5432, ToPort: 5432, SourceSecurityGroupId: !Ref AppSecurityGroup }
+  CacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Redis from app tasks only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - { IpProtocol: tcp, FromPort: 6379, ToPort: 6379, SourceSecurityGroupId: !Ref AppSecurityGroup }
+
+  # ---------------------------------------------------------------- Load balancer
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${ProjectName}-alb'
+      Scheme: internet-facing
+      Type: application
+      Subnets: [!Ref PublicSubnetA, !Ref PublicSubnetB]
+      SecurityGroups: [!Ref AlbSecurityGroup]
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${ProjectName}-web-tg'
+      VpcId: !Ref VPC
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - { Key: deregistration_delay.timeout_seconds, Value: '15' }
+  HttpListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+
+  # ---------------------------------------------------------------- Containers
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${ProjectName}-cluster'
+      CapacityProviders: [FARGATE]
+      DefaultCapacityProviderStrategy:
+        - { CapacityProvider: FARGATE, Weight: 1 }
+      ClusterSettings:
+        - { Name: containerInsights, Value: enabled }   # publishes RunningTaskCount used for scaling
+  WebRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-web'
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EmptyOnDelete: true
+  WorkerRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: !Sub '${ProjectName}-worker'
+      ImageScanningConfiguration: { ScanOnPush: true }
+      EmptyOnDelete: true
+
+  # ---------------------------------------------------------------- Queue
+  OrdersDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-orders-dlq'
+      MessageRetentionPeriod: 1209600
+  OrdersQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-orders'
+      VisibilityTimeout: 120
+      ReceiveMessageWaitTimeSeconds: 20
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt OrdersDLQ.Arn
+        maxReceiveCount: 5
+
+  # ---------------------------------------------------------------- Data layer
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets across two AZs
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Database:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub '${ProjectName}-db'
+      Engine: postgres
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: '20'
+      StorageType: gp3
+      StorageEncrypted: true
+      MultiAZ: true                       # synchronous standby in the second AZ
+      DBName: shop
+      MasterUsername: shopadmin
+      ManageMasterUserPassword: true      # password generated + stored in Secrets Manager
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups: [!Ref DatabaseSecurityGroup]
+      PubliclyAccessible: false
+      BackupRetentionPeriod: 1
+      DeletionProtection: false
+      Tags:
+        - { Key: backup-plan, Value: !Sub '${ProjectName}-daily' }
+
+  CacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      Description: Private subnets across two AZs
+      SubnetIds: [!Ref PrivateSubnetA, !Ref PrivateSubnetB]
+  Cache:
+    Type: AWS::ElastiCache::ReplicationGroup
+    Properties:
+      ReplicationGroupId: !Sub '${ProjectName}-cache'
+      ReplicationGroupDescription: Product catalogue cache
+      Engine: redis
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheClusters: 2                 # primary + replica in different AZs
+      AutomaticFailoverEnabled: true
+      MultiAZEnabled: true
+      CacheSubnetGroupName: !Ref CacheSubnetGroup
+      SecurityGroupIds: [!Ref CacheSecurityGroup]
+
+  # ---------------------------------------------------------------- Backup
+  BackupVault:
+    Type: AWS::Backup::BackupVault
+    Properties:
+      BackupVaultName: !Sub '${ProjectName}-vault'
+  BackupPlan:
+    Type: AWS::Backup::BackupPlan
+    Properties:
+      BackupPlan:
+        BackupPlanName: !Sub '${ProjectName}-daily'
+        BackupPlanRule:
+          - RuleName: daily-rds-snapshot
+            TargetBackupVault: !Ref BackupVault
+            ScheduleExpression: cron(0 3 * * ? *)   # 03:00 UTC daily
+            StartWindowMinutes: 60
+            CompletionWindowMinutes: 180
+            Lifecycle:
+              DeleteAfterDays: !Ref BackupRetentionDays
+  BackupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: backup.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForBackup
+        - arn:aws:iam::aws:policy/service-role/AWSBackupServiceRolePolicyForRestores
+  BackupSelection:
+    Type: AWS::Backup::BackupSelection
+    Properties:
+      BackupPlanId: !Ref BackupPlan
+      BackupSelection:
+        SelectionName: rds-database
+        IamRoleArn: !GetAtt BackupRole.Arn
+        Resources:
+          - !Sub 'arn:${AWS::Partition}:rds:${AWS::Region}:${AWS::AccountId}:db:${Database}'
+
+Outputs:
+  VpcId:
+    Value: !Ref VPC
+    Export: { Name: !Sub '${ProjectName}-VpcId' }
+  PublicSubnets:
+    Value: !Join [',', [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+    Export: { Name: !Sub '${ProjectName}-PublicSubnets' }
+  AppSecurityGroup:
+    Value: !Ref AppSecurityGroup
+    Export: { Name: !Sub '${ProjectName}-AppSG' }
+  ClusterName:
+    Value: !Ref Cluster
+    Export: { Name: !Sub '${ProjectName}-Cluster' }
+  WebTargetGroupArn:
+    Value: !Ref WebTargetGroup
+    Export: { Name: !Sub '${ProjectName}-WebTG' }
+  LoadBalancerFullName:
+    Value: !GetAtt LoadBalancer.LoadBalancerFullName
+    Export: { Name: !Sub '${ProjectName}-AlbFullName' }
+  TargetGroupFullName:
+    Value: !GetAtt WebTargetGroup.TargetGroupFullName
+    Export: { Name: !Sub '${ProjectName}-TgFullName' }
+  LoadBalancerDNS:
+    Value: !GetAtt LoadBalancer.DNSName
+    Export: { Name: !Sub '${ProjectName}-AlbDNS' }
+  LoadBalancerHostedZoneId:
+    Value: !GetAtt LoadBalancer.CanonicalHostedZoneID
+    Export: { Name: !Sub '${ProjectName}-AlbZone' }
+  WebRepositoryUri:
+    Value: !GetAtt WebRepository.RepositoryUri
+    Export: { Name: !Sub '${ProjectName}-WebRepoUri' }
+  WorkerRepositoryUri:
+    Value: !GetAtt WorkerRepository.RepositoryUri
+    Export: { Name: !Sub '${ProjectName}-WorkerRepoUri' }
+  QueueUrl:
+    Value: !Ref OrdersQueue
+    Export: { Name: !Sub '${ProjectName}-QueueUrl' }
+  QueueArn:
+    Value: !GetAtt OrdersQueue.Arn
+    Export: { Name: !Sub '${ProjectName}-QueueArn' }
+  QueueName:
+    Value: !GetAtt OrdersQueue.QueueName
+    Export: { Name: !Sub '${ProjectName}-QueueName' }
+  DBEndpoint:
+    Value: !GetAtt Database.Endpoint.Address
+    Export: { Name: !Sub '${ProjectName}-DBEndpoint' }
+  DBSecretArn:
+    Value: !GetAtt Database.MasterUserSecret.SecretArn
+    Export: { Name: !Sub '${ProjectName}-DBSecretArn' }
+  CachePrimaryEndpoint:
+    Value: !GetAtt Cache.PrimaryEndPoint.Address
+    Export: { Name: !Sub '${ProjectName}-CacheEndpoint' }
+  BackupVaultName:
+    Value: !Ref BackupVault
+  BackupPlanId:
+    Value: !Ref BackupPlan
+  BackupRoleArn:
+    Value: !GetAtt BackupRole.Arn

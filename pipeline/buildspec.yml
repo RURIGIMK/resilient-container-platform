@@ -1,0 +1,43 @@
+# CodeBuild: test, build and push BOTH container images, then emit image definitions
+# that the CodePipeline ECS deploy actions use to roll the web and worker services.
+version: 0.2
+
+env:
+  variables:
+    DOCKER_BUILDKIT: "1"
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 20
+  pre_build:
+    commands:
+      - COMMIT=$(cat COMMIT_SHA 2>/dev/null || echo manual000)
+      - TAG="$(echo $COMMIT | cut -c1-7)-b${CODEBUILD_BUILD_NUMBER}"
+      - echo "Building commit $COMMIT as tag $TAG"
+      - REGISTRY=$(echo "$WEB_REPO_URI" | cut -d/ -f1)
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "$REGISTRY"
+      # Fail fast on broken code before spending time on image builds
+      - (cd app/web && npm install --no-audit --no-fund --silent && npm test)
+      - (cd app/worker && npm install --no-audit --no-fund --silent && npm test)
+      - rm -rf app/web/node_modules app/worker/node_modules
+  build:
+    commands:
+      - docker build --build-arg APP_VERSION="$TAG" -t "$WEB_REPO_URI:$TAG" -t "$WEB_REPO_URI:latest" app/web
+      - docker build -t "$WORKER_REPO_URI:$TAG" -t "$WORKER_REPO_URI:latest" app/worker
+      - docker push "$WEB_REPO_URI:$TAG"
+      - docker push "$WEB_REPO_URI:latest"
+      - docker push "$WORKER_REPO_URI:$TAG"
+      - docker push "$WORKER_REPO_URI:latest"
+  post_build:
+    commands:
+      - printf '[{"name":"web","imageUri":"%s"}]' "$WEB_REPO_URI:$TAG" > imagedefinitions-web.json
+      - printf '[{"name":"worker","imageUri":"%s"}]' "$WORKER_REPO_URI:$TAG" > imagedefinitions-worker.json
+      - cat imagedefinitions-web.json imagedefinitions-worker.json
+
+artifacts:
+  secondary-artifacts:
+    WebImageDef:
+      files: [imagedefinitions-web.json]
+    WorkerImageDef:
+      files: [imagedefinitions-worker.json]

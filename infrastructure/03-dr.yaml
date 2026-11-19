@@ -1,0 +1,127 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient container platform - DNS failover. Route 53 health check on the ALB, PRIMARY failover
+  record to the ALB and SECONDARY record to a static "we'll be right back" page on S3 website hosting.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shop
+  DomainName:
+    Type: String
+    Default: rurigi-shop-capstone.com
+    Description: Hosted zone name. Need not be registered - failover can be verified by querying the zone's name servers directly.
+  RecordPrefix:
+    Type: String
+    Default: www
+
+Mappings:
+  # S3 website endpoints and their fixed Route 53 alias hosted-zone IDs
+  S3Website:
+    us-east-1: { Endpoint: s3-website-us-east-1.amazonaws.com, ZoneId: Z3AQBSTGFYJSTF }
+    us-east-2: { Endpoint: s3-website.us-east-2.amazonaws.com, ZoneId: Z2O1EMRO9K5GLX }
+    us-west-1: { Endpoint: s3-website-us-west-1.amazonaws.com, ZoneId: Z2F56UZL2M1ACD }
+    us-west-2: { Endpoint: s3-website-us-west-2.amazonaws.com, ZoneId: Z3BJ6K6RIION7M }
+    eu-west-1: { Endpoint: s3-website-eu-west-1.amazonaws.com, ZoneId: Z1BKCTXD74EZPE }
+
+Resources:
+  HostedZone:
+    Type: AWS::Route53::HostedZone
+    Properties:
+      Name: !Ref DomainName
+      HostedZoneConfig:
+        Comment: !Sub '${ProjectName} capstone failover zone'
+
+  # The S3 bucket name must equal the record name for an S3-website alias to resolve.
+  MaintenanceBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${RecordPrefix}.${DomainName}'
+      WebsiteConfiguration:
+        IndexDocument: index.html
+        ErrorDocument: index.html
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: false
+        RestrictPublicBuckets: false
+  MaintenanceBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref MaintenanceBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: PublicReadMaintenancePage
+            Effect: Allow
+            Principal: '*'
+            Action: s3:GetObject
+            Resource: !Sub '${MaintenanceBucket.Arn}/*'
+
+  AlbHealthCheck:
+    Type: AWS::Route53::HealthCheck
+    Properties:
+      HealthCheckConfig:
+        Type: HTTP
+        FullyQualifiedDomainName: { 'Fn::ImportValue': !Sub '${ProjectName}-AlbDNS' }
+        Port: 80
+        ResourcePath: /health
+        RequestInterval: 10       # fast checks: ~30s to detect an outage
+        FailureThreshold: 2
+      HealthCheckTags:
+        - { Key: Name, Value: !Sub '${ProjectName}-alb-health' }
+
+  PrimaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${RecordPrefix}.${DomainName}'
+      Type: A
+      SetIdentifier: primary-alb
+      Failover: PRIMARY
+      HealthCheckId: !Ref AlbHealthCheck
+      AliasTarget:
+        DNSName: { 'Fn::ImportValue': !Sub '${ProjectName}-AlbDNS' }
+        HostedZoneId: { 'Fn::ImportValue': !Sub '${ProjectName}-AlbZone' }
+        EvaluateTargetHealth: true
+  SecondaryRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Ref HostedZone
+      Name: !Sub '${RecordPrefix}.${DomainName}'
+      Type: A
+      SetIdentifier: secondary-s3
+      Failover: SECONDARY
+      AliasTarget:
+        DNSName: !FindInMap [S3Website, !Ref 'AWS::Region', Endpoint]
+        HostedZoneId: !FindInMap [S3Website, !Ref 'AWS::Region', ZoneId]
+        EvaluateTargetHealth: false
+
+  HealthCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-primary-unhealthy'
+      AlarmDescription: Route 53 health check on the ALB is failing - traffic is on the S3 maintenance page
+      Namespace: AWS/Route53
+      MetricName: HealthCheckStatus
+      Dimensions: [{ Name: HealthCheckId, Value: !Ref AlbHealthCheck }]
+      Statistic: Minimum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+
+Outputs:
+  HostedZoneId:
+    Value: !Ref HostedZone
+  NameServers:
+    Value: !Join [',', !GetAtt HostedZone.NameServers]
+  RecordName:
+    Value: !Sub '${RecordPrefix}.${DomainName}'
+  HealthCheckId:
+    Value: !Ref AlbHealthCheck
+  MaintenanceBucket:
+    Value: !Ref MaintenanceBucket
+  MaintenanceSiteUrl:
+    Value: !GetAtt MaintenanceBucket.WebsiteURL

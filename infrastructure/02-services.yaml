@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Resilient container platform - ECS Fargate services. Web service behind the ALB (scales on CPU and
+  ALB requests per target) and an SQS worker service (scales on queue backlog per running task).
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: shop
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Initial image tag; CodePipeline takes over and deploys commit-tagged images
+  WebMinTasks:
+    Type: Number
+    Default: 2
+    Description: Set to 0 for the very first deploy, before the pipeline has pushed any image
+  WebMaxTasks:
+    Type: Number
+    Default: 6
+  WorkerMinTasks:
+    Type: Number
+    Default: 1
+  WorkerMaxTasks:
+    Type: Number
+    Default: 10
+  BacklogPerTaskTarget:
+    Type: Number
+    Default: 20
+    Description: Acceptable SQS messages per worker task (≈ max latency / time per message)
+
+Resources:
+  # ---------------------------------------------------------------- IAM
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-db-secret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: { 'Fn::ImportValue': !Sub '${ProjectName}-DBSecretArn' }
+  WebTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: enqueue-orders
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:SendMessage, sqs:GetQueueAttributes]
+                Resource: { 'Fn::ImportValue': !Sub '${ProjectName}-QueueArn' }
+  WorkerTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ecs-tasks.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: consume-orders
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [sqs:ReceiveMessage, sqs:DeleteMessage, sqs:ChangeMessageVisibility, sqs:GetQueueAttributes]
+                Resource: { 'Fn::ImportValue': !Sub '${ProjectName}-QueueArn' }
+
+  WebLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-web'
+      RetentionInDays: 14
+  WorkerLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/ecs/${ProjectName}-worker'
+      RetentionInDays: 14
+
+  # ---------------------------------------------------------------- Web service
+  WebTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-web'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt WebTaskRole.Arn
+      ContainerDefinitions:
+        - Name: web
+          Image: !Sub
+            - '${Repo}:${ImageTag}'
+            - Repo: { 'Fn::ImportValue': !Sub '${ProjectName}-WebRepoUri' }
+          Essential: true
+          PortMappings: [{ ContainerPort: 8080, Protocol: tcp }]
+          Environment:
+            - { Name: PORT, Value: '8080' }
+            - { Name: DB_HOST, Value: { 'Fn::ImportValue': !Sub '${ProjectName}-DBEndpoint' } }
+            - { Name: DB_NAME, Value: shop }
+            - { Name: REDIS_HOST, Value: { 'Fn::ImportValue': !Sub '${ProjectName}-CacheEndpoint' } }
+            - { Name: QUEUE_URL, Value: { 'Fn::ImportValue': !Sub '${ProjectName}-QueueUrl' } }
+            - { Name: CACHE_TTL_SECONDS, Value: '60' }
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn: { 'Fn::ImportValue': !Sub '${ProjectName}-DBSecretArn' }
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn: { 'Fn::ImportValue': !Sub '${ProjectName}-DBSecretArn' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WebLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+  WebService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-web'
+      Cluster: { 'Fn::ImportValue': !Sub '${ProjectName}-Cluster' }
+      TaskDefinition: !Ref WebTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref WebMinTasks
+      HealthCheckGracePeriodSeconds: 30
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100       # rolling update never drops below desired capacity
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [',', { 'Fn::ImportValue': !Sub '${ProjectName}-PublicSubnets' }]
+          SecurityGroups: [{ 'Fn::ImportValue': !Sub '${ProjectName}-AppSG' }]
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8080
+          TargetGroupArn: { 'Fn::ImportValue': !Sub '${ProjectName}-WebTG' }
+
+  WebScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - 'service/${Cluster}/${WebService.Name}'
+        - Cluster: { 'Fn::ImportValue': !Sub '${ProjectName}-Cluster' }
+      MinCapacity: !Ref WebMinTasks
+      MaxCapacity: !Ref WebMaxTasks
+  WebCpuScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: web-cpu-50
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WebScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 50
+        PredefinedMetricSpecification: { PredefinedMetricType: ECSServiceAverageCPUUtilization }
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+  WebRequestScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: web-alb-requests
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WebScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 200
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub
+            - '${Alb}/${Tg}'
+            - Alb: { 'Fn::ImportValue': !Sub '${ProjectName}-AlbFullName' }
+              Tg: { 'Fn::ImportValue': !Sub '${ProjectName}-TgFullName' }
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 120
+
+  # ---------------------------------------------------------------- Worker service
+  WorkerTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${ProjectName}-worker'
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt WorkerTaskRole.Arn
+      ContainerDefinitions:
+        - Name: worker
+          Image: !Sub
+            - '${Repo}:${ImageTag}'
+            - Repo: { 'Fn::ImportValue': !Sub '${ProjectName}-WorkerRepoUri' }
+          Essential: true
+          StopTimeout: 30
+          Environment:
+            - { Name: DB_HOST, Value: { 'Fn::ImportValue': !Sub '${ProjectName}-DBEndpoint' } }
+            - { Name: DB_NAME, Value: shop }
+            - { Name: QUEUE_URL, Value: { 'Fn::ImportValue': !Sub '${ProjectName}-QueueUrl' } }
+            - { Name: WORK_MS, Value: '1000' }
+          Secrets:
+            - Name: DB_USER
+              ValueFrom: !Sub
+                - '${Arn}:username::'
+                - Arn: { 'Fn::ImportValue': !Sub '${ProjectName}-DBSecretArn' }
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - '${Arn}:password::'
+                - Arn: { 'Fn::ImportValue': !Sub '${ProjectName}-DBSecretArn' }
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref WorkerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: worker
+  WorkerService:
+    Type: AWS::ECS::Service
+    Properties:
+      ServiceName: !Sub '${ProjectName}-worker'
+      Cluster: { 'Fn::ImportValue': !Sub '${ProjectName}-Cluster' }
+      TaskDefinition: !Ref WorkerTaskDefinition
+      LaunchType: FARGATE
+      DesiredCount: !Ref WorkerMinTasks
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 100
+        MaximumPercent: 200
+        DeploymentCircuitBreaker: { Enable: true, Rollback: true }
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Split [',', { 'Fn::ImportValue': !Sub '${ProjectName}-PublicSubnets' }]
+          SecurityGroups: [{ 'Fn::ImportValue': !Sub '${ProjectName}-AppSG' }]
+
+  WorkerScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      ResourceId: !Sub
+        - 'service/${Cluster}/${WorkerService.Name}'
+        - Cluster: { 'Fn::ImportValue': !Sub '${ProjectName}-Cluster' }
+      MinCapacity: !Ref WorkerMinTasks
+      MaxCapacity: !Ref WorkerMaxTasks
+  # Backlog-per-task target tracking (AWS-recommended pattern for queue workers):
+  #   backlog = ApproximateNumberOfMessagesVisible / RunningTaskCount
+  # Raw queue depth alone does not shrink as tasks are added, so it over-scales.
+  WorkerBacklogScaling:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: worker-sqs-backlog-per-task
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref WorkerScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: !Ref BacklogPerTaskTarget
+        ScaleOutCooldown: 60
+        ScaleInCooldown: 180
+        CustomizedMetricSpecification:
+          Metrics:
+            - Id: visible
+              ReturnData: false
+              MetricStat:
+                Stat: Sum
+                Metric:
+                  Namespace: AWS/SQS
+                  MetricName: ApproximateNumberOfMessagesVisible
+                  Dimensions:
+                    - Name: QueueName
+                      Value: { 'Fn::ImportValue': !Sub '${ProjectName}-QueueName' }
+            - Id: tasks
+              ReturnData: false
+              MetricStat:
+                Stat: Average
+                Metric:
+                  Namespace: ECS/ContainerInsights
+                  MetricName: RunningTaskCount
+                  Dimensions:
+                    - Name: ClusterName
+                      Value: { 'Fn::ImportValue': !Sub '${ProjectName}-Cluster' }
+                    - Name: ServiceName
+                      Value: !GetAtt WorkerService.Name
+            - Id: backlogPerTask
+              Label: SQS backlog per worker task
+              Expression: visible / IF(tasks > 0, tasks, 1)
+              ReturnData: true
+
+Outputs:
+  WebServiceName:
+    Value: !GetAtt WebService.Name
+  WorkerServiceName:
+    Value: !GetAtt WorkerService.Name
+  ExecutionRoleArn:
+    Value: !GetAtt ExecutionRole.Arn
